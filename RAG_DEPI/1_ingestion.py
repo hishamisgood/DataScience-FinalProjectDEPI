@@ -1,7 +1,6 @@
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-
 def get_document_chunks(data_folder_path="./data"):
     loader = DirectoryLoader(
         data_folder_path,
@@ -15,22 +14,17 @@ def get_document_chunks(data_folder_path="./data"):
         return []
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=400,
-        chunk_overlap=50,
+        chunk_size=1000,  # Adjusted for better semantic context retention
+        chunk_overlap=200,
     )
 
     chunks = text_splitter.split_documents(documents)
 
+    # Retained the validation check, but removed the redundant reassignment
     for chunk in chunks:
-        source = chunk.metadata.get("source")
-        page = chunk.metadata.get("page")
-
-        if source is None or page is None:
+        if "source" not in chunk.metadata or "page" not in chunk.metadata:
             raise ValueError(
                 "A document chunk is missing its source or page metadata."
             )
-
-        chunk.metadata["source"] = source
-        chunk.metadata["page"] = page
 
     return chunks
