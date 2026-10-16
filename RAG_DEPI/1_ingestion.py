@@ -14,8 +14,8 @@ def get_document_chunks(data_folder_path="./data"):
         return []
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,  # Adjusted for better semantic context retention
-        chunk_overlap=200,
+        chunk_size=400,  # Adjusted for better semantic context retention
+        chunk_overlap=50,
     )
 
     chunks = text_splitter.split_documents(documents)
