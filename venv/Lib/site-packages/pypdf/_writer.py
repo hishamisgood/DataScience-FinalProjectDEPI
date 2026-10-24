@@ -78,7 +78,6 @@ from .constants import (
     OutlineFontFlag,
     PageLabelStyle,
     PagesAttributes,
-    TypFitArguments,
     UserAccessPermissions,
 )
 from .constants import FieldDictionaryAttributes as FA
@@ -141,10 +140,10 @@ class ObjectDeletionFlag(enum.IntFlag):
 
 
 def _rolling_checksum(stream: BytesIO, blocksize: int = 65536) -> str:
-    hash = hashlib.md5(usedforsecurity=False)
+    hash_object = hashlib.md5(usedforsecurity=False)
     for block in iter(lambda: stream.read(blocksize), b""):
-        hash.update(block)
-    return hash.hexdigest()
+        hash_object.update(block)
+    return hash_object.hexdigest()
 
 
 class PdfWriter(PdfDocCommon):
@@ -174,6 +173,29 @@ class PdfWriter(PdfDocCommon):
 
     """
 
+    incremental: bool
+    """
+    Returns if the PdfWriter object has been started in incremental mode.
+    """
+
+    _objects: list[Optional[PdfObject]]
+    """
+    The indirect objects in the PDF.
+    For the incremental case, it will be filled with None
+    in clone_reader_document_root.
+    """
+
+    _id_translated: dict[int, dict[Union[int, Literal["PreventGC"]], Any]]
+    """
+    List of already translated IDs.
+    dict[id(pdf)][(idnum, generation)]
+    """
+
+    _reader: Optional[PdfReader]
+    """
+    The document being appended to, in incremental mode only.
+    """
+
     def __init__(
         self,
         fileobj: Union[PdfReader, StrByteType, Path, None] = "",
@@ -194,16 +216,8 @@ class PdfWriter(PdfDocCommon):
         """
 
         self.incremental = incremental or full
-        """
-        Returns if the PdfWriter object has been started in incremental mode.
-        """
 
-        self._objects: list[Optional[PdfObject]] = []
-        """
-        The indirect objects in the PDF.
-        For the incremental case, it will be filled with None
-        in clone_reader_document_root.
-        """
+        self._objects = []
 
         self._original_hash: list[int] = []
         """
@@ -216,17 +230,13 @@ class PdfWriter(PdfDocCommon):
         This is used for compression.
         """
 
-        self._id_translated: dict[int, dict[Union[int, Literal["PreventGC"]], Any]] = {}
-        """List of already translated IDs.
-           dict[id(pdf)][(idnum, generation)]
-        """
+        self._id_translated = {}
 
         self._info_obj: Optional[PdfObject]
         """The PDF files's document information dictionary,
         defined by Info in the PDF file's trailer dictionary."""
 
-        self._reader: Optional[PdfReader] = None
-        """The document being appended to, in incremental mode only."""
+        self._reader = None
 
         self._ID: Union[ArrayObject, None] = None
         """The PDF file identifier,
@@ -563,7 +573,8 @@ class PdfWriter(PdfDocCommon):
             # pages may or may not already be added.  we store the
             # information we need, so that we can resolve the references
             # later.
-            self._unresolved_links.extend(extract_links(page, page_org))
+            if "/Annots" not in excluded_keys:
+                self._unresolved_links.extend(extract_links(page, page_org))
             self._merged_in_pages[page_org.indirect_reference] = page.indirect_reference
 
         return page
@@ -1203,8 +1214,8 @@ class PdfWriter(PdfDocCommon):
 
         try:
             self._flatten()
-        except IndexError:
-            raise PdfReadError("Got index error while flattening.")
+        except IndexError as exception:  # pragma: no cover
+            raise PdfReadError("Got index error while flattening.") from exception  # pragma: no cover
 
         assert self.flattened_pages is not None
         for p in self.flattened_pages:
@@ -1332,8 +1343,8 @@ class PdfWriter(PdfDocCommon):
         if algorithm is not None:
             try:
                 alg = getattr(EncryptAlgorithm, algorithm.replace("-", "_"))
-            except AttributeError:
-                raise ValueError(f"Algorithm '{algorithm}' NOT supported")
+            except AttributeError as exception:  # pragma: no cover
+                raise ValueError(f"Algorithm '{algorithm}' NOT supported") from exception  # pragma: no cover
         else:
             alg = EncryptAlgorithm.RC4_128
             if not use_128bit:
@@ -1882,6 +1893,8 @@ class PdfWriter(PdfDocCommon):
                     page_ref = self.pages[page_number].indirect_reference
                 except IndexError:
                     page_ref = NumberObject(page_number)
+            else:
+                raise TypeError(f"page_number: invalid type {type(page_number)}")
             if page_ref is None:
                 logger_warning(
                     "can not find reference of page %(page_number)s",
@@ -1954,22 +1967,38 @@ class PdfWriter(PdfDocCommon):
         self,
         title: str,
         page_number: int,
+        fit: Optional[Fit] = None,
     ) -> IndirectObject:
+        """
+        Add a named destination to a page in this PDF.
+
+        Args:
+            title: Name of the destination.
+            page_number: Index of the destination page, starting at zero.
+            fit: How the destination is displayed.
+                Defaults to fitting the page horizontally with its
+                top edge at the top of the window.
+
+        Returns:
+            A reference to the destination's GoTo action.
+
+        """
         page_ref = self._get_page_reference(page_number)
+        if fit is None:
+            top = cast(DictionaryObject, page_ref.get_object()).get(PG.MEDIABOX)
+            top = RectangleObject(top).top if top is not None else 0
+            fit = Fit.fit_horizontally(top=top)
+        if not isinstance(title, TextStringObject):
+            title = TextStringObject(str(title))
         dest = DictionaryObject()
         dest.update(
             {
-                NameObject(GoToActionArguments.D): ArrayObject(
-                    [page_ref, NameObject(TypFitArguments.FIT_H), NumberObject(826)]
-                ),
+                NameObject(GoToActionArguments.D): Destination(title, page_ref, fit).dest_array,
                 NameObject(GoToActionArguments.S): NameObject("/GoTo"),
             }
         )
 
         dest_ref = self._add_object(dest)
-        if not isinstance(title, TextStringObject):
-            title = TextStringObject(str(title))
-
         self.add_named_destination_array(title, dest_ref)
         return dest_ref
 
@@ -3260,30 +3289,42 @@ class PdfWriter(PdfDocCommon):
 
     def find_outline_item(
         self,
-        outline_item: dict[str, Any],
+        outline_item: Union[IndirectObject, str],
         root: Optional[OutlineType] = None,
+        *,
+        visited: Optional[set[int]] = None,
     ) -> Optional[list[int]]:
         if root is None:
-            o = self.get_outline_root()
+            outline = self.get_outline_root()
         else:
-            o = cast("TreeObject", root)
+            outline = cast("TreeObject", root)
+        if visited is None:
+            visited = set()
 
-        i = 0
-        while o is not None:
+        index = 0
+        while outline is not None:
             if (
-                o.indirect_reference == outline_item
-                or o.get("/Title", None) == outline_item
+                outline.indirect_reference == outline_item
+                or outline.get("/Title", None) == outline_item
             ):
-                return [i]
-            if "/First" in o:
-                res = self.find_outline_item(
-                    outline_item, cast(OutlineType, o["/First"])
+                return [index]
+
+            outline_id = id(outline)
+            if outline_id in visited:
+                raise LimitReachedError("Detected cyclic outline hierarchy.")
+            visited.add(outline_id)
+
+            if "/First" in outline:
+                result = self.find_outline_item(
+                    outline_item=outline_item,
+                    root=cast(OutlineType, outline["/First"]),
+                    visited=visited,
                 )
-                if res:
-                    return ([i] if "/Title" in o else []) + res
-            if "/Next" in o:
-                i += 1
-                o = cast(TreeObject, o["/Next"])
+                if result:
+                    return ([index] if "/Title" in outline else []) + result
+            if "/Next" in outline:
+                index += 1
+                outline = cast(TreeObject, outline["/Next"])
             else:
                 return None
         raise PyPdfError("This line is theoretically unreachable.")  # pragma: no cover

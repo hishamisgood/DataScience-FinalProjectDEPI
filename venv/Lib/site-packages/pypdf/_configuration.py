@@ -37,6 +37,10 @@ class Configuration:
     """The maximum allowed declared ``/Length`` value for streams."""
     array_based_stream_maximum_output_length: int = 75_000_000
     """The maximum allowed output length for array-based streams."""
+    array_maximum_element_count: int = 100_000
+    """The maximum allowed number of elements inside an array."""
+    dictionary_maximum_element_count: int = 100_000
+    """The maximum allowed number of key-value pairs inside a dictionary."""
 
     jbig2_maximum_output_length: int = 75_000_000
     """
@@ -63,6 +67,11 @@ class Configuration:
     The maximum allowed number of bytes to attempt the recovery with when using the ``/FlateDecode`` filter
     (zlib compression).
     """
+    brotli_maximum_output_length: int = 75_000_000
+    """
+    The maximum allowed number of uncompressed bytes during decompression when using the ``/BrotliDecode`` filter
+    (Brotli compression).
+    """
 
     flate_maximum_columns: int = 250_000
     """The maximum allowed number of columns when using the ``/FlateDecode`` filter."""
@@ -71,6 +80,16 @@ class Configuration:
 
     image_maximum_buffer_size: int = 75_000_000
     """The maximum allowed number of bytes to allocate for images."""
+
+    stream_filters_maximum_length: int = 16
+    """The maximum allowed number of filters per stream."""
+    stream_decoding_work_maximum_length: int = 300_000_000
+    """The maximum allowed accumulated decoding work in bytes per stream."""
+    stream_parsing_work_maximum_count: int = 2_000_000
+    """
+    The maximum parsing budget for a content stream, including operands, operators, and elements in
+    nested arrays and dictionaries.
+    """
 
     xmp_maximum_input_length: int = 5_000_000
     """The maximum allowed actual decompressed stream length in bytes for XMP data."""
@@ -86,6 +105,11 @@ class Configuration:
     """The maximum allowed number of entries in the page tree."""
     page_tree_maximum_depth: int = 100
     """The maximum allowed depth of the page tree."""
+
+    form_fields_maximum_entries: int = 100_000
+    """The maximum allowed number of form fields."""
+    form_fields_maximum_depth: int = 100
+    """The maximum allowed depth for form fields."""
 
     xform_maximum_invocations_per_extraction: int = 5_000
     """The maximum allowed number of ``/XObject`` forms per page during text extraction."""

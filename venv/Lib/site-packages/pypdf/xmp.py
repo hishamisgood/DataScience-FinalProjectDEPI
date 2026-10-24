@@ -24,7 +24,6 @@ from xml.dom.xmlbuilder import Options
 from xml.parsers.expat import ExpatError, XMLParserType
 
 from ._configuration import get_configuration
-from ._protocols import XmpInformationProtocol
 from ._utils import StreamType, deprecate_with_replacement, deprecation_no_replacement
 from .errors import LimitReachedError, PdfReadError, XmpDocumentError
 from .generic import ContentStream, PdfObject, StreamObject
@@ -131,13 +130,14 @@ def _converter_date(value: str) -> datetime.datetime:
     milliseconds = int(milliseconds_dec)
 
     tzd = matches.group("tzd") or "Z"
-    dt = datetime.datetime(year, month, day, hour, minute, seconds, milliseconds)
+    try:
+        dt = datetime.datetime(year, month, day, hour, minute, seconds, milliseconds)
+    except ValueError as exc:
+        raise ValueError(f"Invalid date {value!r}: {exc}") from exc
     if tzd != "Z":
-        tzd_hours, tzd_minutes = (int(x) for x in tzd.split(":"))
-        tzd_hours *= -1
-        if tzd_hours < 0:
-            tzd_minutes *= -1
-        dt = dt + datetime.timedelta(hours=tzd_hours, minutes=tzd_minutes)
+        tzd_hours, tzd_minutes = (int(x) for x in tzd[1:].split(":"))
+        offset = datetime.timedelta(hours=tzd_hours, minutes=tzd_minutes)
+        dt = dt - offset if tzd.startswith("+") else dt + offset
     return dt
 
 
@@ -213,7 +213,7 @@ class _XmpBuilder(ExpatBuilderNS):
         parser.StartElementHandler = self.start_element_handler
 
 
-class XmpInformation(XmpInformationProtocol, PdfObject):
+class XmpInformation(PdfObject):
     """
     An object that represents Extensible Metadata Platform (XMP) metadata.
     Usually accessed by :py:attr:`xmp_metadata()<pypdf.PdfReader.xmp_metadata>`.
@@ -233,8 +233,8 @@ class XmpInformation(XmpInformationProtocol, PdfObject):
                     f"XMP stream size {length} exceeds limit of {configuration.xmp_maximum_input_length}."
                 )
             doc_root: Document = _XmpBuilder().parseString(data)
-        except (AttributeError, ExpatError) as e:
-            raise PdfReadError(f"XML in XmpInformation was invalid: {e}")
+        except (AttributeError, ExpatError) as exception:
+            raise PdfReadError(f"XML in XmpInformation was invalid: {exception}") from exception
         rdf_roots = doc_root.getElementsByTagNameNS(RDF_NAMESPACE, "RDF")
         if not rdf_roots:
             raise PdfReadError(

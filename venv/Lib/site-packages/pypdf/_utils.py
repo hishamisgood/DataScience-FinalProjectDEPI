@@ -31,6 +31,7 @@ __author_email__ = "biziqe@mathieu.fenniak.net"
 
 import functools
 import logging
+import os
 import re
 import sys
 import warnings
@@ -45,6 +46,7 @@ from typing import (
     NoReturn,
     Optional,
     Union,
+    cast,
 )
 
 if sys.version_info[:2] >= (3, 10):
@@ -283,6 +285,37 @@ def skip_over_comment(stream: StreamType) -> None:
             tok = stream.read(1)
             if tok == b"":
                 raise PdfStreamError("File ended unexpectedly.")
+
+
+def skip_over_comments(stream: StreamType, *, limit: Optional[int] = None) -> None:
+    """
+    Skip consecutive leading comments and the whitespace following each one.
+
+    The stream must be positioned at the first comment, if any. If the next
+    character is not ``%``, the stream position is unchanged. If only whitespace
+    follows the last comment before EOF, leave the stream at the last whitespace
+    byte, preserving the existing read_object behaviour for a missing object.
+
+    Args:
+        stream: The stream to read from.
+        limit: The maximum number of comments to skip, or ``None`` for no limit.
+
+    Raises:
+        LimitReachedError: If another comment follows after ``limit`` comments;
+            the stream remains at its ``%`` without reading its body.
+        PdfStreamError: If a comment ends before a line ending.
+
+    """
+    tok = stream.read(1)
+    stream.seek(-len(tok), 1)
+    comment_count = 0
+    while tok == b"%":
+        if limit is not None and comment_count >= limit:
+            raise LimitReachedError(f"Maximum number of leading comments reached: {limit}.")
+        skip_over_comment(stream)
+        tok = read_non_whitespace(stream)
+        stream.seek(-1, 1)
+        comment_count += 1
 
 
 def read_until_regex(*, stream: StreamType, regex: Pattern[bytes], length: int = sys.maxsize) -> bytes:
@@ -552,6 +585,28 @@ def _human_readable_bytes(bytes: int) -> str:
     if bytes < 10**9:
         return f"{bytes / 10**6:.1f} MB"
     return f"{bytes / 10**9:.1f} GB"
+
+
+def get_stream_size(stream: StreamType) -> int:
+    if hasattr(stream, "getbuffer"):
+        return cast(int, stream.getbuffer().nbytes)
+
+    position = stream.tell()
+    stream.seek(0, os.SEEK_END)
+    size = stream.tell()
+    stream.seek(position)
+    return size
+
+
+def get_stream_data(stream: StreamType) -> bytes:
+    if hasattr(stream, "getbuffer"):
+        return bytes(stream.getbuffer())
+
+    position = stream.tell()
+    stream.seek(0, os.SEEK_SET)
+    data = stream.read(-1)
+    stream.seek(position)
+    return cast(bytes, data)
 
 
 # The following class has been copied from Django:

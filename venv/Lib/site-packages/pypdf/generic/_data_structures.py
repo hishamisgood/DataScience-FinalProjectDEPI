@@ -25,7 +25,6 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-
 __author__ = "Mathieu Fenniak"
 __author_email__ = "biziqe@mathieu.fenniak.net"
 
@@ -39,11 +38,13 @@ from math import ceil
 from typing import (
     Any,
     Callable,
+    NamedTuple,
     Optional,
     Union,
     cast,
 )
 
+from .. import get_configuration
 from .._protocols import PdfReaderProtocol, PdfWriterProtocol, XmpInformationProtocol
 from .._utils import (
     WHITESPACES,
@@ -55,6 +56,7 @@ from .._utils import (
     read_until_regex,
     read_until_whitespace,
     skip_over_comment,
+    skip_over_comments,
 )
 from ..constants import (
     CheckboxRadioButtonAttributes,
@@ -86,7 +88,7 @@ from ._image_inline import (
     extract_inline__run_length_decode,
     extract_inline_default,
 )
-from ._utils import read_hex_string_from_stream, read_string_from_stream
+from ._utils import StreamParsingBudget, read_hex_string_from_stream, read_string_from_stream
 
 if sys.version_info >= (3, 11):
     from typing import Self
@@ -96,6 +98,14 @@ else:
 logger = logging.getLogger(__name__)
 
 IndirectPattern = re.compile(rb"[+-]?(\d+)\s+(\d+)\s+R[^a-zA-Z]")
+
+# Direct objects of these types are neither streams nor indirect objects.
+# Large arrays consist mostly of them, for example in the /ParentTree of the
+# structure tree, so the clone loops check the exact type first and skip the
+# slower isinstance() checks.
+_SCALAR_TYPES = frozenset(
+    (BooleanObject, ByteStringObject, FloatObject, NameObject, NullObject, NumberObject, TextStringObject)
+)
 
 
 class ArrayObject(list[Any], PdfObject):
@@ -131,7 +141,10 @@ class ArrayObject(list[Any], PdfObject):
             self._reference_clone(ArrayObject(), pdf_dest, force_duplicate=True),
         )
         for data in self:
-            if isinstance(data, StreamObject):
+            if type(data) in _SCALAR_TYPES:
+                # Same as the generic case below, but without the isinstance() checks.
+                arr.append(data.clone(pdf_dest, force_duplicate, ignore_fields))
+            elif isinstance(data, StreamObject):
                 dup = data._reference_clone(
                     data.clone(pdf_dest, force_duplicate, ignore_fields),
                     pdf_dest,
@@ -241,19 +254,33 @@ class ArrayObject(list[Any], PdfObject):
         stream.write(b" ]")
 
     @staticmethod
+    def _check_limits(*, remaining_elements: int, parsing_budget: Optional[StreamParsingBudget]) -> int:
+        remaining_elements -= 1
+        if remaining_elements < 0:
+            raise LimitReachedError("Reached maximum array element count.")
+        if parsing_budget is not None:
+            parsing_budget.remaining_budget -= 1
+            if parsing_budget.remaining_budget < 0:
+                raise LimitReachedError("Reached maximum number of tokens.")
+        return remaining_elements
+
+    @staticmethod
     def read_from_stream(
         stream: StreamType,
         pdf: Optional[PdfReaderProtocol],
         forced_encoding: Union[str, list[str], dict[int, str], None] = None,
+        *,
+        parsing_budget: Optional[StreamParsingBudget] = None,
     ) -> "ArrayObject":
         arr = ArrayObject()
         tmp = stream.read(1)
         if tmp != b"[":
             raise PdfReadError("Could not read array")
+        remaining_elements = get_configuration().array_maximum_element_count
         while True:
             # skip leading whitespace
             tok = stream.read(1)
-            while tok.isspace():
+            while tok.isspace() or tok in WHITESPACES:
                 tok = stream.read(1)
             if tok == b"":
                 break
@@ -261,14 +288,23 @@ class ArrayObject(list[Any], PdfObject):
                 stream.seek(-1, 1)
                 skip_over_comment(stream)
                 continue
-            stream.seek(-1, 1)
             # check for array ending
-            peek_ahead = stream.read(1)
-            if peek_ahead == b"]":
+            if tok == b"]":
                 break
+
+            remaining_elements = ArrayObject._check_limits(
+                remaining_elements=remaining_elements, parsing_budget=parsing_budget
+            )
+            if tok == b"n":
+                # Shortcut for null, as some arrays consist mostly of nulls
+                rest = stream.read(3)
+                if rest == b"ull":
+                    arr.append(NullObject())
+                    continue
+                stream.seek(-len(rest), 1)
             stream.seek(-1, 1)
             # read and append object
-            arr.append(read_object(stream, pdf, forced_encoding))
+            arr.append(read_object(stream, pdf, forced_encoding, parsing_budget=parsing_budget))
         return arr
 
 
@@ -411,7 +447,9 @@ class DictionaryObject(dict[Any, Any], PdfObject):
 
         for k, v in src.items():
             if k not in ignore_fields:
-                if isinstance(v, StreamObject):
+                # The type check does not change the result. It only skips the
+                # slower isinstance() check for the most common values.
+                if type(v) not in _SCALAR_TYPES and isinstance(v, StreamObject):
                     if not hasattr(v, "indirect_reference"):
                         v.indirect_reference = None
                     vv = v.clone(pdf_dest, force_duplicate, ignore_fields)
@@ -470,10 +508,12 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                 return default
 
             # Walk upward
-            current = cast(
-                "DictionaryObject",
-                current["/Parent"].get_object(),
-            )
+            parent = current["/Parent"].get_object()
+            if not isinstance(parent, DictionaryObject):
+                # A malformed /Parent that does not resolve to a dictionary
+                # terminates the inheritance walk (the key was not found).
+                return default
+            current = parent
 
     def __setitem__(self, key: Any, value: Any) -> Any:
         if not isinstance(key, PdfObject):
@@ -580,6 +620,8 @@ class DictionaryObject(dict[Any, Any], PdfObject):
         stream: StreamType,
         pdf: Optional[PdfReaderProtocol],
         forced_encoding: Union[str, list[str], dict[int, str], None] = None,
+        *,
+        parsing_budget: Optional[StreamParsingBudget] = None,
     ) -> "DictionaryObject":
         tmp = stream.read(2)
         if tmp != b"<<":
@@ -588,6 +630,7 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                 "stream must begin with '<<'"
             )
         data: dict[Any, Any] = {}
+        remaining_count = get_configuration().dictionary_maximum_element_count
         while True:
             tok = read_non_whitespace(stream)
             if tok == b"\x00":
@@ -603,9 +646,18 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                 stream.read(1)
                 break
             stream.seek(-1, 1)
+
+            remaining_count -= 1
+            if remaining_count < 0:
+                raise LimitReachedError("Reached maximum number of dictionary entries.")
+            if parsing_budget is not None:
+                parsing_budget.remaining_budget -= 2
+                if parsing_budget.remaining_budget < 0:
+                    raise LimitReachedError("Reached maximum number of tokens.")
+
             try:
                 try:
-                    key = read_object(stream, pdf)
+                    key = read_object(stream, pdf, parsing_budget=parsing_budget)
                     if isinstance(key, NullObject):
                         break
                     if not isinstance(key, NameObject):
@@ -619,12 +671,15 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                     continue
                 tok = read_non_whitespace(stream)
                 stream.seek(-1, 1)
-                value = read_object(stream, pdf, forced_encoding)
-            except (RecursionError, LimitReachedError) as exc:
-                raise PdfReadError(exc.__repr__())
+                value = read_object(stream, pdf, forced_encoding, parsing_budget=parsing_budget)
+            except LimitReachedError:
+                # Always propagate security issues.
+                raise
+            except RecursionError as exc:
+                raise PdfReadError(exc.__repr__()) from exc
             except Exception as exc:
                 if pdf is not None and pdf.strict:
-                    raise PdfReadError(exc.__repr__())
+                    raise PdfReadError(exc.__repr__()) from exc
                 logger_warning("%(exception)r", source=__name__, exception=exc)
                 retval = DictionaryObject()
                 retval.update(data)
@@ -643,6 +698,20 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                     raise PdfReadError(msg % values)
                 logger_warning(msg, source=__name__, **values)
 
+        DictionaryObject._read_stream_data(stream=stream, pdf=pdf, data=data)
+        if "__streamdata__" in data:
+            return StreamObject.initialize_from_dictionary(data)
+        retval = DictionaryObject()
+        retval.update(data)
+        return retval
+
+    @staticmethod
+    def _read_stream_data(
+        *,
+        stream: StreamType,
+        pdf: Optional[PdfReaderProtocol],
+        data: dict[Any, Any]
+    ) -> None:
         pos = stream.tell()
         s = read_non_whitespace(stream)
         if s == b"s" and stream.read(5) == b"tream":
@@ -715,11 +784,6 @@ class DictionaryObject(dict[Any, Any], PdfObject):
                     )
         else:
             stream.seek(pos, 0)
-        if "__streamdata__" in data:
-            return StreamObject.initialize_from_dictionary(data)
-        retval = DictionaryObject()
-        retval.update(data)
-        return retval
 
 
 class TreeObject(DictionaryObject):
@@ -850,25 +914,16 @@ class TreeObject(DictionaryObject):
         return child_reference
 
     def _remove_node_from_tree(
-        self, prev: Any, prev_ref: Any, cur: Any, last: Any
+        self, *, previous: Any, previous_reference: Any, current: Any, last: Any
     ) -> None:
-        """
-        Adjust the pointers of the linked list and tree node count.
-
-        Args:
-            prev:
-            prev_ref:
-            cur:
-            last:
-
-        """
-        next_ref = cur.get(NameObject("/Next"), None)
-        if prev is None:
-            if next_ref:
+        """Adjust the pointers of the linked list and tree node count."""
+        next_reference = current.get("/Next", None)
+        if previous is None:
+            if next_reference:
                 # Removing first tree node
-                next_obj = next_ref.get_object()
-                del next_obj[NameObject("/Prev")]
-                self[NameObject("/First")] = next_ref
+                next_object = next_reference.get_object()
+                del next_object["/Prev"]
+                self[NameObject("/First")] = next_reference
                 self[NameObject("/Count")] = NumberObject(
                     self[NameObject("/Count")] - 1  # type: ignore[operator]
                 )
@@ -876,58 +931,62 @@ class TreeObject(DictionaryObject):
             else:
                 # Removing only tree node
                 self[NameObject("/Count")] = NumberObject(0)
-                del self[NameObject("/First")]
+                del self["/First"]
                 if NameObject("/Last") in self:
                     del self[NameObject("/Last")]
         else:
-            if next_ref:
+            if next_reference:
                 # Removing middle tree node
-                next_obj = next_ref.get_object()
-                next_obj[NameObject("/Prev")] = prev_ref
-                prev[NameObject("/Next")] = next_ref
+                next_object = next_reference.get_object()
+                next_object[NameObject("/Prev")] = previous_reference
+                previous[NameObject("/Next")] = next_reference
             else:
                 # Removing last tree node
-                assert cur == last
-                del prev[NameObject("/Next")]
-                self[NameObject("/Last")] = prev_ref
-            self[NameObject("/Count")] = NumberObject(self[NameObject("/Count")] - 1)  # type: ignore[operator]
+                assert current == last
+                del previous["/Next"]
+                self[NameObject("/Last")] = previous_reference
+            self[NameObject("/Count")] = NumberObject(self["/Count"] - 1)  # type: ignore[operator]
 
     def remove_child(self, child: Any) -> None:
-        child_obj = child.get_object()
-        child = child_obj.indirect_reference
+        child_object = child.get_object()
 
-        if NameObject("/Parent") not in child_obj:
+        if "/Parent" not in child_object:
             raise ValueError("Removed child does not appear to be a tree item")
-        if child_obj[NameObject("/Parent")] != self:
+        if child_object["/Parent"] != self:
             raise ValueError("Removed child is not a member of this tree")
 
         found = False
-        prev_ref = None
-        prev = None
-        cur_ref: Optional[Any] = self[NameObject("/First")]
-        cur: Optional[dict[str, Any]] = cur_ref.get_object()  # type: ignore[union-attr]
-        last_ref = self[NameObject("/Last")]
-        last = last_ref.get_object()
-        while cur is not None:
-            if cur == child_obj:
-                TreeObject._remove_node_from_tree(self, prev, prev_ref, cur, last)
+        previous_reference = None
+        previous = None
+        current_reference: Optional[Any] = self["/First"]
+        current: Optional[dict[str, Any]] = current_reference.get_object()  # type: ignore[union-attr]
+        last_reference = self["/Last"]
+        last = last_reference.get_object()
+        visited: set[int] = set()
+        while current is not None:
+            if current == child_object:
+                TreeObject._remove_node_from_tree(
+                    self, previous=previous, previous_reference=previous_reference, current=current, last=last
+                )
                 found = True
                 break
+            current_id = id(current)
+            if current_id in visited:
+                raise LimitReachedError("Detected cyclic /Next hierarchy.")
+            visited.add(current_id)
 
-            # Go to the next node
-            prev_ref = cur_ref
-            prev = cur
-            if NameObject("/Next") in cur:
-                cur_ref = cur[NameObject("/Next")]
-                cur = cur_ref.get_object()
-            else:
-                cur_ref = None
-                cur = None
+            # Go to the next node.
+            previous_reference = current_reference
+            previous = current
+            if "/Next" not in current:
+                break
+            current_reference = current["/Next"]
+            current = current_reference.get_object()
 
         if not found:
             raise ValueError("Removal couldn't find item in tree")
 
-        _reset_node_tree_relationship(child_obj)
+        _reset_node_tree_relationship(child_object)
 
     def remove_from_tree(self) -> None:
         """Remove the object from the tree it is in."""
@@ -965,7 +1024,23 @@ def _reset_node_tree_relationship(child_obj: Any) -> None:
         del child_obj[NameObject("/Prev")]
 
 
+class _FontFileCharacterMap(NamedTuple):
+    """The character map pypdf._cmap derived from an embedded font program. See #4156."""
+
+    digest: bytes
+    """SHA-256 digest of the decoded font data the map was derived from."""
+    map_dict: dict[Any, Any]
+    int_entry: list[int]
+
+
 class StreamObject(DictionaryObject):
+    _font_file_character_map: Optional[_FontFileCharacterMap] = None
+    """
+    The character map pypdf._cmap derived from this stream as an embedded font program. Parsing a CFF font
+    program with fontTools is expensive, and the same program is reached from every font resource and page
+    referencing it. See #4156.
+    """
+
     def __init__(self) -> None:
         self._data: bytes = b""
         self.decoded_self: Optional[DecodedStreamObject] = None
@@ -1365,10 +1440,27 @@ class ContentStream(DecodedStreamObject):
         # no need to call DictionaryObjection or anything
         # like super(DictionaryObject,self)._clone(src, pdf_dest, force_duplicate, ignore_fields, visited)
 
+    @staticmethod
+    def _check_limits(
+            *,
+            remaining_elements: Optional[int] = None,
+            parsing_budget: StreamParsingBudget,
+            token_decrement: int
+    ) -> Optional[int]:
+        if remaining_elements is not None:
+            remaining_elements -= 1
+            if remaining_elements < 0:
+                raise LimitReachedError("Reached maximum number of tokens.")
+        parsing_budget.remaining_budget -= token_decrement
+        if parsing_budget.remaining_budget < 0:
+            raise LimitReachedError("Reached maximum number of tokens per stream.")
+        return remaining_elements
+
     def _parse_content_stream(self, stream: StreamType) -> None:
         # 7.8.2 Content Streams
         stream.seek(0, 0)
         operands: list[Union[int, str, PdfObject]] = []
+        parsing_budget = StreamParsingBudget(remaining_budget=get_configuration().stream_parsing_work_maximum_count)
         while True:
             peek = read_non_whitespace(stream)
             if peek in (b"", 0):
@@ -1382,9 +1474,11 @@ class ContentStream(DecodedStreamObject):
                     # begin inline image - a completely different parsing
                     # mechanism is required, of course... thanks buddy...
                     assert operands == []
-                    ii = self._read_inline_image(stream)
+                    self._check_limits(parsing_budget=parsing_budget, token_decrement=2)
+                    ii = self._read_inline_image(stream, parsing_budget=parsing_budget)
                     self._operations.append((ii, b"INLINE IMAGE"))
                 else:
+                    self._check_limits(parsing_budget=parsing_budget, token_decrement=1)
                     self._operations.append((operands, operator))
                     operands = []
             elif peek == b"%":
@@ -1396,12 +1490,14 @@ class ContentStream(DecodedStreamObject):
                 while peek not in (b"\r", b"\n", b""):
                     peek = stream.read(1)
             else:
-                operands.append(read_object(stream, None, self.forced_encoding))
+                self._check_limits(parsing_budget=parsing_budget, token_decrement=1)
+                operands.append(read_object(stream, None, self.forced_encoding, parsing_budget=parsing_budget))
 
-    def _read_inline_image(self, stream: StreamType) -> dict[str, Any]:
+    def _read_inline_image(self, stream: StreamType, parsing_budget: StreamParsingBudget) -> dict[str, Any]:
         # begin reading just after the "BI" - begin image
         # first read the dictionary of settings.
         settings = DictionaryObject()
+        remaining_count: Optional[int] = get_configuration().dictionary_maximum_element_count
         while True:
             tok = read_non_whitespace(stream)
             if not tok:
@@ -1410,10 +1506,14 @@ class ContentStream(DecodedStreamObject):
             if tok == b"I":
                 # "ID" - begin of image data
                 break
-            key = read_object(stream, self.pdf)
-            tok = read_non_whitespace(stream)
+            remaining_count = self._check_limits(
+                remaining_elements=remaining_count, parsing_budget=parsing_budget, token_decrement=2
+            )
+
+            key = read_object(stream, self.pdf, parsing_budget=parsing_budget)
+            _ = read_non_whitespace(stream)
             stream.seek(-1, 1)
-            value = read_object(stream, self.pdf)
+            value = read_object(stream, self.pdf, parsing_budget=parsing_budget)
             settings[key] = value
         # left at beginning of ID
         tmp = stream.read(3)
@@ -1548,13 +1648,37 @@ class ContentStream(DecodedStreamObject):
         super().write_to_stream(stream, encryption_key)
 
 
-def read_object(
+# Bound comment scanning without consuming Python recursion depth.
+_MAX_LEADING_COMMENTS = 1000
+
+
+def read_object(  # noqa: PLR0911
     stream: StreamType,
     pdf: Optional[PdfReaderProtocol],
     forced_encoding: Union[str, list[str], dict[int, str], None] = None,
+    *,
+    parsing_budget: Optional[StreamParsingBudget] = None,
 ) -> PdfObject:
+    """
+    Read the next object from the stream.
+
+    Args:
+        stream: The stream to read from.
+        pdf: The corresponding PDF file.
+        forced_encoding: The encoding to enforce, if any.
+        parsing_budget: The allowed parsing budget, optional. If set, only applies to dictionaries,
+            arrays and content streams.
+
+    Returns:
+        The parsed object.
+    """
     tok = stream.read(1)
     stream.seek(-1, 1)  # reset to start
+    if tok == b"%":
+        # Skip consecutive comments in a loop instead of recursing per comment.
+        skip_over_comments(stream, limit=_MAX_LEADING_COMMENTS)
+        tok = stream.read(1)
+        stream.seek(-1, 1)  # reset to start
     if tok == b"/":
         return NameObject.read_from_stream(stream, pdf)
     if tok == b"<":
@@ -1562,10 +1686,10 @@ def read_object(
         peek = stream.read(2)
         stream.seek(-2, 1)  # reset to start
         if peek == b"<<":
-            return DictionaryObject.read_from_stream(stream, pdf, forced_encoding)
+            return DictionaryObject.read_from_stream(stream, pdf, forced_encoding, parsing_budget=parsing_budget)
         return read_hex_string_from_stream(stream, forced_encoding)
     if tok == b"[":
-        return ArrayObject.read_from_stream(stream, pdf, forced_encoding)
+        return ArrayObject.read_from_stream(stream, pdf, forced_encoding, parsing_budget=parsing_budget)
     if tok in (b"t", b"f"):
         return BooleanObject.read_from_stream(stream)
     if tok == b"(":
@@ -1574,19 +1698,25 @@ def read_object(
         return NullObject()
     if tok == b"n":
         return NullObject.read_from_stream(stream)
-    if tok == b"%":
-        # comment
-        skip_over_comment(stream)
-        tok = read_non_whitespace(stream)
-        stream.seek(-1, 1)
-        return read_object(stream, pdf, forced_encoding)
     if tok in b"0123456789+-.":
         # number object OR indirect reference
         peek = stream.read(20)
-        stream.seek(-len(peek), 1)  # reset to start
-        if IndirectPattern.match(peek) is not None:
+        match = IndirectPattern.match(peek)
+        if match is not None:
             assert pdf is not None, "mypy"
-            return IndirectObject.read_from_stream(stream, pdf)
+            # Continue after the "R", the match includes the character following it
+            stream.seek(match.end() - 1 - len(peek), 1)
+            # The object number includes an optional sign
+            return IndirectObject(int(peek[: match.end(1)]), int(match[2]), pdf)
+        number_end = NumberObject.NumberPattern.search(peek)
+        if number_end is not None:
+            # The whole number is in the peek, there is no need to read it again
+            num = peek[: number_end.start()]
+            stream.seek(len(num) - len(peek), 1)
+            if b"." in num:
+                return FloatObject(num)
+            return NumberObject(num)
+        stream.seek(-len(peek), 1)  # reset to start
         return NumberObject.read_from_stream(stream)
     pos = stream.tell()
     stream.seek(-20, 1)
